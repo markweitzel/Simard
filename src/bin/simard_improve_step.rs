@@ -40,8 +40,8 @@ use serde_json::json;
 
 use simard::gym_scoring::{GymSuiteScore, detect_regression};
 use simard::self_improve::{
-    ImprovementConfig, ImprovementCycle, ImprovementDecision, ImprovementPhase, ProposedChange,
-    WeakDimension, decide, find_weak_dimensions,
+    ImprovementConfig, ImprovementCycle, ImprovementDecision, ImprovementHistory, ImprovementPhase,
+    ProposedChange, WeakDimension, decide, find_weak_dimensions,
 };
 
 const DEFAULT_WEAK_THRESHOLD: f64 = 0.7;
@@ -94,6 +94,32 @@ fn parse_json<T: for<'de> Deserialize<'de>>(s: &str, what: &str) -> T {
 fn emit<T: Serialize>(value: &T) {
     let s = serde_json::to_string(value).unwrap_or_else(|e| die(&format!("serialize: {e}")));
     let _ = writeln!(std::io::stdout(), "{s}");
+}
+
+/// Emit an [`ImprovementCycle`] to stdout **and** append it to the on-disk
+/// improvement history so cycles survive process restart.
+///
+/// History file location (in order of preference):
+///   1. `$SIMARD_STATE_ROOT/improvement_history.jsonl`
+///   2. `$HOME/.simard/improvement_history.jsonl`
+fn emit_cycle(cycle: &ImprovementCycle) {
+    // Persist before emitting so a downstream parser can trust the file is
+    // already written when it reads stdout.
+    let state_root = std::env::var("SIMARD_STATE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/azureuser".into());
+            std::path::PathBuf::from(home).join(".simard")
+        });
+    match ImprovementHistory::open(&state_root) {
+        Ok(history) => {
+            if let Err(e) = history.append(cycle) {
+                eprintln!("simard-improve-step: warn: history append failed: {e}");
+            }
+        }
+        Err(e) => eprintln!("simard-improve-step: warn: history open failed: {e}"),
+    }
+    emit(cycle);
 }
 
 fn cmd_eval(args: &[String]) {
@@ -194,7 +220,7 @@ fn cmd_decide(args: &[String]) {
             weak_dimension_details: weak,
             target_dimension: target,
         };
-        emit(&cycle);
+        emit_cycle(&cycle);
         return;
     }
 
@@ -235,7 +261,7 @@ fn cmd_decide(args: &[String]) {
         weak_dimension_details: weak,
         target_dimension: target,
     };
-    emit(&cycle);
+    emit_cycle(&cycle);
 }
 
 fn cmd_apply_or_rollback(args: &[String]) {

@@ -14,6 +14,7 @@ fn counting_bridge() -> (CognitiveMemoryBridge, Arc<AtomicU32>) {
             "memory.record_sensory" => Ok(json!({"id": "sen_1"})),
             "memory.push_working" => Ok(json!({"id": "wrk_1"})),
             "memory.store_episode" => Ok(json!({"id": "epi_1"})),
+            "memory.get_working" => Ok(json!({"slots": []})),
             "memory.search_facts" => Ok(json!({"facts": []})),
             "memory.check_triggers" => Ok(json!({"prospectives": []})),
             "memory.recall_procedure" => Ok(json!({"procedures": []})),
@@ -163,8 +164,66 @@ fn consolidation_intake_with_facts_pushes_to_working_memory() {
 fn consolidation_persistence_flushes_and_consolidates() {
     let (bridge, count) = counting_bridge();
     consolidation_persistence(&test_session_id(), &bridge).unwrap();
-    // store_episode + consolidate_episodes = 2
-    assert_eq!(count.load(Ordering::SeqCst), 2);
+    // get_working (returns empty, so 0 drain store_episode calls)
+    // + store_episode (marker) + consolidate_episodes = 3
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn consolidation_persistence_drains_working_slots_before_marker() {
+    // Bridge that returns two working slots so we can verify each is drained.
+    let call_log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = call_log.clone();
+    let transport = InMemoryBridgeTransport::new("test-drain", move |method, params| {
+        log.lock().unwrap().push(method.to_string());
+        match method {
+            "memory.get_working" => Ok(json!({
+                "slots": [
+                    {"node_id": "w1", "slot_type": "goal", "content": "fix bug", "task_id": "s1", "relevance": 1.0},
+                    {"node_id": "w2", "slot_type": "context-summary", "content": "2 facts found", "task_id": "s1", "relevance": 0.8},
+                ]
+            })),
+            "memory.store_episode" => {
+                let label = params
+                    .get("source_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                log.lock().unwrap().push(format!("store_episode:{label}"));
+                Ok(json!({"id": "epi_1"}))
+            }
+            "memory.consolidate_episodes" => Ok(json!({"id": null})),
+            _ => Err(crate::bridge::BridgeErrorPayload {
+                code: -32601,
+                message: format!("unknown: {method}"),
+            }),
+        }
+    });
+    let bridge = CognitiveMemoryBridge::new(Box::new(transport));
+    consolidation_persistence(&test_session_id(), &bridge).unwrap();
+
+    let log = call_log.lock().unwrap();
+    // drain episodes must appear before the consolidation-persistence marker
+    let drain_goal = log
+        .iter()
+        .position(|s| s == "store_episode:goal")
+        .expect("drain episode for 'goal' slot");
+    let drain_ctx = log
+        .iter()
+        .position(|s| s == "store_episode:context-summary")
+        .expect("drain episode for 'context-summary' slot");
+    let marker = log
+        .iter()
+        .position(|s| s == "store_episode:consolidation-persistence")
+        .expect("consolidation-persistence marker episode");
+    assert!(
+        drain_goal < marker,
+        "goal drain must precede marker: {log:?}"
+    );
+    assert!(
+        drain_ctx < marker,
+        "context-summary drain must precede marker: {log:?}"
+    );
 }
 
 /// Round-trip verification: intake → execution → persistence → recall.
@@ -199,4 +258,39 @@ fn round_trip_execution_memory_recall() {
         "expected ≥2 episodes from intake+persistence, got {}",
         stats.episodic_count
     );
+}
+
+/// Cross-session durability: store an episode, drop the DB, reopen it,
+/// and verify the episode is still recalled.
+///
+/// This guards against regressions where consolidation writes are not
+/// fsync-d to disk (i.e. only live in the in-memory LadybugDB buffer)
+/// and are lost when the process exits.
+#[test]
+#[cfg(unix)]
+fn cross_session_persistence_recall_survives_reopen() {
+    use crate::cognitive_memory::NativeCognitiveMemory;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_root = tmp.path().to_path_buf();
+
+    // Session A: store an episode via consolidation_persistence.
+    {
+        let mem = NativeCognitiveMemory::open(&state_root).expect("open session A");
+        let sid = test_session_id();
+        intake_memory_operations("cross-session recall test", &sid, &mem).unwrap();
+        consolidation_persistence(&sid, &mem).unwrap();
+        // `mem` is dropped here — database handle released.
+    }
+
+    // Session B: reopen the same on-disk DB and verify the episode is present.
+    {
+        let mem = NativeCognitiveMemory::open(&state_root).expect("reopen session B");
+        let stats = mem.get_statistics().unwrap();
+        assert!(
+            stats.episodic_count >= 1,
+            "expected ≥1 episode after reopen (cross-session durability), got {}",
+            stats.episodic_count
+        );
+    }
 }

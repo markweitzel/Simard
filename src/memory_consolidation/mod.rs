@@ -299,20 +299,37 @@ pub fn consolidation_intake(
 /// to ensure any remaining working-memory items are persisted as episodes
 /// before the session terminates.  This closes the intake→persistence
 /// round-trip and prevents data loss on unexpected shutdown.
+///
+/// Steps:
+/// 1. Drain every slot from working memory into the episode store, using
+///    `slot_type` as the `source_label` so provenance is preserved.
+/// 2. Store a single marker episode recording that the consolidation pass ran.
+/// 3. Consolidate episodes into long-term storage.
+///
+/// All errors propagate via `?` — a failure aborts the persistence phase
+/// rather than silently dropping data.
 pub fn consolidation_persistence(
     session_id: &SessionId,
     bridge: &dyn CognitiveMemoryOps,
 ) -> SimardResult<()> {
-    // Store an episodic record capturing the consolidation event.
+    // 1. Drain all current working-memory slots into the episode store so
+    //    nothing is lost when working memory is cleared at session end.
+    let slots = bridge.get_working(session_id.as_str())?;
+    for slot in &slots {
+        bridge.store_episode(&slot.content, &slot.slot_type, None)?;
+    }
+
+    // 2. Store a marker episode recording the consolidation pass.
     bridge.store_episode(
-        &format!("Session {session_id} flushing working memory to episodes"),
+        &format!(
+            "Session {session_id} flushing working memory to episodes ({} slots drained)",
+            slots.len()
+        ),
         "consolidation-persistence",
         None,
     )?;
 
-    // Consolidate any remaining episodes into long-term storage. Errors are
-    // propagated so a failed consolidation aborts the persistence phase
-    // rather than silently dropping data.
+    // 3. Consolidate any remaining episodes into long-term storage.
     bridge.consolidate_episodes(20)?;
 
     Ok(())
